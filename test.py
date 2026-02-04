@@ -15,6 +15,9 @@ import numpy as np
 from tabulate import tabulate
 from utils import get_transform
 
+# [新增]
+from mamba_module import MambaAdapter
+
 def setup_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -28,6 +31,7 @@ from visualization import visualizer
 from metrics import image_level_metrics, pixel_level_metrics
 from tqdm import tqdm
 from scipy.ndimage import gaussian_filter
+
 def test(args):
     img_size = args.image_size
     features_list = args.features_list
@@ -40,7 +44,21 @@ def test(args):
 
     AnomalyCLIP_parameters = {"Prompt_length": args.n_ctx, "learnabel_text_embedding_depth": args.depth, "learnabel_text_embedding_length": args.t_n_ctx}
     
+    # 加载 CLIP 模型
     model, _ = AnomalyCLIP_lib.load("ViT-L/14@336px", device=device, design_details = AnomalyCLIP_parameters)
+    
+    # [新增] --- 初始化 Mamba Adapter ---
+    # 确保维度匹配
+    if hasattr(model, 'visual'):
+        visual_dim = model.visual.output_dim
+    else:
+        visual_dim = 768 # Fallback
+    
+    visual_adapter = MambaAdapter(d_model=visual_dim).to(device)
+    # 设为 Eval 模式
+    visual_adapter.eval()
+    # [新增结束] ------------------------
+
     model.eval()
 
     preprocess, target_transform = get_transform(args)
@@ -64,8 +82,28 @@ def test(args):
         metrics[obj]['image-ap'] = 0
 
     prompt_learner = AnomalyCLIP_PromptLearner(model.to("cpu"), AnomalyCLIP_parameters)
-    checkpoint = torch.load(args.checkpoint_path)
-    prompt_learner.load_state_dict(checkpoint["prompt_learner"])
+    
+    # [修改] 加载权重
+    print(f"Loading checkpoint from {args.checkpoint_path}")
+    checkpoint = torch.load(args.checkpoint_path, map_location=device)
+    
+    # 加载 Prompt Learner
+    if "prompt_learner" in checkpoint:
+        prompt_learner.load_state_dict(checkpoint["prompt_learner"])
+    else:
+        # 兼容旧版权重，如果 checkpoint 本身就是 state_dict
+        try:
+            prompt_learner.load_state_dict(checkpoint)
+        except:
+            print("Warning: Could not load prompt_learner weights.")
+
+    # [新增] 加载 Mamba Adapter 权重
+    if "visual_adapter" in checkpoint:
+        visual_adapter.load_state_dict(checkpoint["visual_adapter"])
+        print("Success: Loaded Mamba visual_adapter weights.")
+    else:
+        print("Warning: 'visual_adapter' not found in checkpoint. Using random initialization (Performance will be low).")
+
     prompt_learner.to(device)
     model.to(device)
     model.visual.DAPM_replace(DPAM_layer = 20)
@@ -87,9 +125,25 @@ def test(args):
         results[cls_name[0]]['gt_sp'].extend(items['anomaly'].detach().cpu())
 
         with torch.no_grad():
-            image_features, patch_features = model.encode_image(image, features_list, DPAM_layer = 20)
+            # 1. 获取 CLIP 原始特征
+            image_features, patch_features_list = model.encode_image(image, features_list, DPAM_layer = 20)
             image_features = image_features / image_features.norm(dim=-1, keepdim=True)
 
+            # 2. [新增] Mamba 增强 Patch Features
+            # 推理阶段直接在这里调用，因为不需要梯度，所以放在 no_grad 里也没问题
+            enhanced_patch_features = []
+            for patch_feat in patch_features_list:
+                if isinstance(patch_feat, torch.Tensor):
+                    # 输入: [B, L, D]
+                    feat_out = visual_adapter(patch_feat)
+                    enhanced_patch_features.append(feat_out)
+                else:
+                    enhanced_patch_features.append(patch_feat)
+            
+            # 使用增强后的列表
+            patch_features = enhanced_patch_features
+
+            # ... 之后的逻辑保持不变 ...
             text_probs = image_features @ text_features.permute(0, 2, 1)
             text_probs = (text_probs/0.07).softmax(-1)
             text_probs = text_probs[:, 0, 1]
@@ -176,9 +230,9 @@ def test(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser("AnomalyCLIP", add_help=True)
     # paths
-    parser.add_argument("--data_path", type=str, default="./data/visa", help="path to test dataset")
+    parser.add_argument("--data_path", type=str, default=".autodl-fs/visa", help="path to test dataset")
     parser.add_argument("--save_path", type=str, default='./results/', help='path to save results')
-    parser.add_argument("--checkpoint_path", type=str, default='./checkpoint/', help='path to checkpoint')
+    parser.add_argument("--checkpoint_path", type=str, default='./checkpoint/epoch_15.pth', help='path to checkpoint')
     # model
     parser.add_argument("--dataset", type=str, default='mvtec')
     parser.add_argument("--features_list", type=int, nargs="+", default=[6, 12, 18, 24], help="features used")
