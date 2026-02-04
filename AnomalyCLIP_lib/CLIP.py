@@ -247,25 +247,17 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
+    # 找到 class VisionTransformer(nn.Module): 下的 forward 方法，直接替换整个方法
+
     def forward(self, x: torch.Tensor):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        
+        # 添加 class token
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
         
-        #####################################################################################
-        side = int((self.positional_embedding.shape[0] - 1) ** 0.5)
-        new_side = int((x.shape[1] - 1) ** 0.5)
-
-        # update the position embedding during inference for varied input size
-        if side != new_side:
-            new_pos = self.positional_embedding[1:, :].reshape(-1, side, side, x.shape[-1]).permute(0, 3, 1, 2)
-            new_pos = torch.nn.functional.interpolate(new_pos, (new_side, new_side), mode='bilinear')
-            new_pos = new_pos.reshape(-1, x.shape[-1], new_side * new_side).transpose(1, 2)
-            self.positional_embedding.data = torch.cat([self.positional_embedding[:1, :], new_pos[0]], 0)
-        #####################################################################################
-        
-        
+        # 添加 positional embedding
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
 
@@ -273,13 +265,21 @@ class VisionTransformer(nn.Module):
         x = self.transformer(x)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
-        #x = self.ln_post(x[:, 0, :])
-        x = self.ln_post(x) # return both cls token and image tokens
-
+        # --- 修改开始：保留完整序列 ---
+        # 原始代码通常是: 
+        # x = self.ln_post(x[:, 0, :])
+        # if self.proj is not None: x = x @ self.proj
+        
+        # 修改为: 对整个序列做 LayerNorm
+        x = self.ln_post(x)
+        
+        # 修改为: 对整个序列做 Projection
         if self.proj is not None:
             x = x @ self.proj
-
-        return x
+            
+        return x 
+        # 返回形状: [Batch, 197, 512] (以 ViT-B/16 为例)
+        # --- 修改结束 ---
 
 
 class CLIP(nn.Module):
